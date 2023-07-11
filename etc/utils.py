@@ -1,19 +1,51 @@
 import os
 import urllib.request
 import bz2
-import torch
+import flwr as fl
+import torch, torch.nn as nn
 import numpy as np
+import timeit
 import shutil
 import xgboost as xgb
+import functools
 
 from typing import Any, Dict, List, Optional, Tuple, Union
 from xgboost import XGBClassifier, XGBRegressor
+from logging import DEBUG, INFO
 from matplotlib import pyplot as plt
-from flwr.common import NDArray, NDArrays
+from collections import OrderedDict
+from flwr.common import (
+    NDArray, NDArrays,
+    EvaluateIns, EvaluateRes, FitIns, FitRes,
+    GetPropertiesIns, GetPropertiesRes, GetParametersIns, GetParametersRes,
+    Status, Code, parameters_to_ndarrays, ndarrays_to_parameters,
+    DisconnectRes, Parameters, ReconnectIns, Scalar
+)
 from torchmetrics import Accuracy, MeanSquaredError
 from sklearn.metrics import mean_squared_error, accuracy_score
+from flwr.server.app import ServerConfig
 from sklearn.datasets import load_svmlight_file
 from torch.utils.data import DataLoader, Dataset, random_split
+from flwr.common.logger import log
+from flwr.common.typing import GetParametersIns
+from flwr.common.typing import Parameters
+from flwr.server.history import History
+from flwr.server.strategy import FedXgbNnAvg, Strategy
+from flwr.server.client_proxy import ClientProxy
+from flwr.server.client_manager import ClientManager, SimpleClientManager
+from flwr.server.server import (
+    reconnect_clients, reconnect_client, fit_clients, fit_client,
+    _handle_finished_future_after_fit, evaluate_clients, evaluate_client, _handle_finished_future_after_evaluate,
+)
+
+FitResultsAndFailures = Tuple[
+    List[Tuple[ClientProxy, FitRes]],
+    List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+]
+EvaluateResultsAndFailures = Tuple[
+    List[Tuple[ClientProxy, EvaluateRes]],
+    List[Union[Tuple[ClientProxy, EvaluateRes], BaseException]],
+]
 
 class TreeDataset(Dataset):
     def __init__(self, data: NDArray, labels: NDArray) -> None:
@@ -30,12 +62,15 @@ class TreeDataset(Dataset):
         return sample
 
 class CNN(nn.Module):
-    def __init__(self, n_channel: int = 64) -> None:
+    def __init__(
+        self, task_type : str = 'regression', client_num_tree : int = 100, 
+        client_num : int = 2, n_channel: int = 64
+    ) -> None:
         super(CNN, self).__init__()
         n_out = 1
         self.task_type = task_type
         self.conv1d = nn.Conv1d(
-            1, n_channel, kernel_size=client_tree_num, stride=client_tree_num, padding=0
+            1, n_channel, kernel_size=client_num_tree, stride=client_num_tree, padding=0
         )
         self.layer_direct = nn.Linear(n_channel * client_num, n_out)
         self.ReLU = nn.ReLU()
@@ -72,7 +107,10 @@ class CNN(nn.Module):
         for k, v in zip(self.state_dict().keys(), weights):
             if v.ndim != 0:
                 layer_dict[k] = torch.Tensor(np.array(v, copy=True))
+        print(layer_dict)
         state_dict = OrderedDict(layer_dict)
+        print("WAIT HERE ", "\n")
+        print(state_dict)
         self.load_state_dict(state_dict, strict=True)
 
 
@@ -189,6 +227,424 @@ def test(
         print("\n")
 
     return total_loss / n_samples, total_result / n_samples, n_samples
+
+class FL_Client(fl.client.Client):
+    def __init__(
+        self,
+        task_type: str,
+        trainloader: DataLoader,
+        valloader: DataLoader,
+        client_tree_num: int,
+        client_num: int,
+        cid: str,
+        log_progress: bool = False,
+    ):
+        """
+        Creates a client for training `network.Net` on tabular dataset.
+        """
+        self.task_type = task_type
+        print("TASK CLIENT: ", self.task_type)
+        self.cid = cid
+        self.tree = construct_tree_from_loader(trainloader, client_tree_num, task_type)
+        self.trainloader_original = trainloader
+        self.valloader_original = valloader
+        self.trainloader = None
+        self.valloader = None
+        self.client_tree_num = client_tree_num
+        self.client_num = client_num
+        self.properties = {"tensor_type": "numpy.ndarray"}
+        self.log_progress = log_progress
+
+        # instantiate model
+        self.net = CNN(
+            task_type = self.task_type, client_num_tree = self.client_tree_num,
+            client_num = self.client_num
+        )
+
+        # determine device
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    def get_properties(self, ins: GetPropertiesIns) -> GetPropertiesRes:
+        return GetPropertiesRes(properties=self.properties)
+
+    def get_parameters(
+        self, ins: GetParametersIns
+    ) -> Tuple[
+        GetParametersRes, Union[Tuple[XGBClassifier, int], Tuple[XGBRegressor, int]]
+    ]:
+        return [
+            GetParametersRes(
+                status=Status(Code.OK, ""),
+                parameters=ndarrays_to_parameters(self.net.get_weights()),
+            ),
+            (self.tree, int(self.cid)),
+        ]
+
+    def set_parameters(
+        self,
+        parameters: Tuple[
+            Parameters,
+            Union[
+                Tuple[XGBClassifier, int],
+                Tuple[XGBRegressor, int],
+                List[Union[Tuple[XGBClassifier, int], Tuple[XGBRegressor, int]]],
+            ],
+        ],
+    ) -> Union[
+        Tuple[XGBClassifier, int],
+        Tuple[XGBRegressor, int],
+        List[Union[Tuple[XGBClassifier, int], Tuple[XGBRegressor, int]]],
+    ]:
+        self.net.set_weights(parameters_to_ndarrays(parameters[0]))
+        return parameters[1]
+
+    def fit(self, fit_params: FitIns) -> FitRes:
+        # Process incoming request to train
+        num_iterations = fit_params.config["num_iterations"]
+        batch_size = fit_params.config["batch_size"]
+        aggregated_trees = self.set_parameters(fit_params.parameters)
+
+        if type(aggregated_trees) is list:
+            print("Client " + self.cid + ": recieved", len(aggregated_trees), "trees")
+        else:
+            print("Client " + self.cid + ": only had its own tree")
+        self.trainloader = tree_encoding_loader(
+            self.trainloader_original,
+            batch_size,
+            aggregated_trees,
+            self.client_tree_num,
+            self.client_num,
+        )
+        self.valloader = tree_encoding_loader(
+            self.valloader_original,
+            batch_size,
+            aggregated_trees,
+            self.client_tree_num,
+            self.client_num,
+        )
+
+        # num_iterations = None special behaviour: train(...) runs for a single epoch, however many updates it may be
+        num_iterations = num_iterations or len(self.trainloader)
+
+        # Train the model
+        print(f"Client {self.cid}: training for {num_iterations} iterations/updates")
+        self.net.to(self.device)
+        train_loss, train_result, num_examples = train(
+            self.task_type,
+            self.net,
+            self.trainloader,
+            device=self.device,
+            num_iterations=num_iterations,
+            log_progress=self.log_progress,
+        )
+        print(
+            f"Client {self.cid}: training round complete, {num_examples} examples processed"
+        )
+
+        # Return training information: model, number of examples processed and metrics
+        if self.task_type == "classification":
+            return FitRes(
+                status=Status(Code.OK, ""),
+                parameters=self.get_parameters(fit_params.config),
+                num_examples=num_examples,
+                metrics={"loss": train_loss, "accuracy": train_result},
+            )
+        elif self.task_type == "regression":
+            return FitRes(
+                status=Status(Code.OK, ""),
+                parameters=self.get_parameters(fit_params.config),
+                num_examples=num_examples,
+                metrics={"loss": train_loss, "mse": train_result},
+            )
+
+    def evaluate(self, eval_params: EvaluateIns) -> EvaluateRes:
+        # Process incoming request to evaluate
+        self.set_parameters(eval_params.parameters)
+
+        # Evaluate the model
+        self.net.to(self.device)
+        loss, result, num_examples = test(
+            self.task_type,
+            self.net,
+            self.valloader,
+            device=self.device,
+            log_progress=self.log_progress,
+        )
+
+        # Return evaluation information
+        if self.task_type == "classification":
+            print(
+                f"Client {self.cid}: evaluation on {num_examples} examples: loss={loss:.4f}, accuracy={result:.4f}"
+            )
+            return EvaluateRes(
+                status=Status(Code.OK, ""),
+                loss=loss,
+                num_examples=num_examples,
+                metrics={"accuracy": result},
+            )
+        elif self.task_type == "regression":
+            print(
+                f"Client {self.cid}: evaluation on {num_examples} examples: loss={loss:.4f}, mse={result:.4f}"
+            )
+            return EvaluateRes(
+                status=Status(Code.OK, ""),
+                loss=loss,
+                num_examples=num_examples,
+                metrics={"mse": result},
+            )
+
+class FL_Server(fl.server.Server):
+    """Flower server."""
+
+    def __init__(
+        self, *, client_manager: ClientManager, strategy: Optional[Strategy] = None
+    ) -> None:
+        self._client_manager: ClientManager = client_manager
+        self.parameters: Parameters = Parameters(
+            tensors=[], tensor_type="numpy.ndarray"
+        )
+        self.strategy: Strategy = strategy
+        self.max_workers: Optional[int] = None
+
+    # pylint: disable=too-many-locals
+    def fit(self, num_rounds: int, timeout: Optional[float]) -> History:
+        """Run federated averaging for a number of rounds."""
+        history = History()
+
+        # Initialize parameters
+        log(INFO, "Initializing global parameters")
+        self.parameters = self._get_initial_parameters(timeout=timeout)
+
+        log(INFO, "Evaluating initial parameters")
+        res = self.strategy.evaluate(0, parameters=self.parameters)
+        if res is not None:
+            log(
+                INFO,
+                "initial parameters (loss, other metrics): %s, %s",
+                res[0],
+                res[1],
+            )
+            history.add_loss_centralized(server_round=0, loss=res[0])
+            history.add_metrics_centralized(server_round=0, metrics=res[1])
+
+        # Run federated learning for num_rounds
+        log(INFO, "FL starting")
+        start_time = timeit.default_timer()
+
+        for current_round in range(1, num_rounds + 1):
+            # Train model and replace previous global model
+            res_fit = self.fit_round(server_round=current_round, timeout=timeout)
+            if res_fit:
+                parameters_prime, _, _ = res_fit  # fit_metrics_aggregated
+                if parameters_prime:
+                    self.parameters = parameters_prime
+
+            # Evaluate model using strategy implementation
+            res_cen = self.strategy.evaluate(current_round, parameters=self.parameters)
+            if res_cen is not None:
+                loss_cen, metrics_cen = res_cen
+                log(
+                    INFO,
+                    "fit progress: (%s, %s, %s, %s)",
+                    current_round,
+                    loss_cen,
+                    metrics_cen,
+                    timeit.default_timer() - start_time,
+                )
+                history.add_loss_centralized(server_round=current_round, loss=loss_cen)
+                history.add_metrics_centralized(
+                    server_round=current_round, metrics=metrics_cen
+                )
+
+            # Evaluate model on a sample of available clients
+            res_fed = self.evaluate_round(server_round=current_round, timeout=timeout)
+            if res_fed:
+                loss_fed, evaluate_metrics_fed, _ = res_fed
+                if loss_fed:
+                    history.add_loss_distributed(
+                        server_round=current_round, loss=loss_fed
+                    )
+                    history.add_metrics_distributed(
+                        server_round=current_round, metrics=evaluate_metrics_fed
+                    )
+
+        # Bookkeeping
+        end_time = timeit.default_timer()
+        elapsed = end_time - start_time
+        log(INFO, "FL finished in %s", elapsed)
+        return history
+
+    def evaluate_round(
+        self,
+        server_round: int,
+        timeout: Optional[float],
+    ) -> Optional[
+        Tuple[Optional[float], Dict[str, Scalar], EvaluateResultsAndFailures]
+    ]:
+        """Validate current global model on a number of clients."""
+
+        # Get clients and their respective instructions from strategy
+        client_instructions = self.strategy.configure_evaluate(
+            server_round=server_round,
+            parameters=self.parameters,
+            client_manager=self._client_manager,
+        )
+        if not client_instructions:
+            log(INFO, "evaluate_round %s: no clients selected, cancel", server_round)
+            return None
+        log(
+            DEBUG,
+            "evaluate_round %s: strategy sampled %s clients (out of %s)",
+            server_round,
+            len(client_instructions),
+            self._client_manager.num_available(),
+        )
+
+        # Collect `evaluate` results from all clients participating in this round
+        results, failures = evaluate_clients(
+            client_instructions,
+            max_workers=self.max_workers,
+            timeout=timeout,
+        )
+        log(
+            DEBUG,
+            "evaluate_round %s received %s results and %s failures",
+            server_round,
+            len(results),
+            len(failures),
+        )
+
+        # Aggregate the evaluation results
+        aggregated_result: Tuple[
+            Optional[float],
+            Dict[str, Scalar],
+        ] = self.strategy.aggregate_evaluate(server_round, results, failures)
+
+        loss_aggregated, metrics_aggregated = aggregated_result
+        return loss_aggregated, metrics_aggregated, (results, failures)
+
+    def fit_round(
+        self,
+        server_round: int,
+        timeout: Optional[float],
+    ) -> Optional[
+        Tuple[
+            Optional[
+                Tuple[
+                    Parameters,
+                    Union[
+                        Tuple[XGBClassifier, int],
+                        Tuple[XGBRegressor, int],
+                        List[
+                            Union[Tuple[XGBClassifier, int], Tuple[XGBRegressor, int]]
+                        ],
+                    ],
+                ]
+            ],
+            Dict[str, Scalar],
+            FitResultsAndFailures,
+        ]
+    ]:
+        """Perform a single round of federated averaging."""
+
+        # Get clients and their respective instructions from strategy
+        client_instructions = self.strategy.configure_fit(
+            server_round=server_round,
+            parameters=self.parameters,
+            client_manager=self._client_manager,
+        )
+
+        if not client_instructions:
+            log(INFO, "fit_round %s: no clients selected, cancel", server_round)
+            return None
+        log(
+            DEBUG,
+            "fit_round %s: strategy sampled %s clients (out of %s)",
+            server_round,
+            len(client_instructions),
+            self._client_manager.num_available(),
+        )
+
+        # Collect `fit` results from all clients participating in this round
+        results, failures = fit_clients(
+            client_instructions=client_instructions,
+            max_workers=self.max_workers,
+            timeout=timeout,
+        )
+
+        log(
+            DEBUG,
+            "fit_round %s received %s results and %s failures",
+            server_round,
+            len(results),
+            len(failures),
+        )
+
+        # Aggregate training results
+        NN_aggregated: Parameters
+        trees_aggregated: Union[
+            Tuple[XGBClassifier, int],
+            Tuple[XGBRegressor, int],
+            List[Union[Tuple[XGBClassifier, int], Tuple[XGBRegressor, int]]],
+        ]
+        metrics_aggregated: Dict[str, Scalar]
+        aggregated, metrics_aggregated = self.strategy.aggregate_fit(
+            server_round, results, failures
+        )
+        NN_aggregated, trees_aggregated = aggregated[0], aggregated[1]
+
+        if type(trees_aggregated) is list:
+            print("Server side aggregated", len(trees_aggregated), "trees.")
+        else:
+            print("Server side did not aggregate trees.")
+
+        return (
+            [NN_aggregated, trees_aggregated],
+            metrics_aggregated,
+            (results, failures),
+        )
+
+    def _get_initial_parameters(
+        self, timeout: Optional[float]
+    ) -> Tuple[Parameters, Union[Tuple[XGBClassifier, int], Tuple[XGBRegressor, int]]]:
+        """Get initial parameters from one of the available clients."""
+
+        # Server-side parameter initialization
+        parameters: Optional[Parameters] = self.strategy.initialize_parameters(
+            client_manager=self._client_manager
+        )
+        if parameters is not None:
+            log(INFO, "Using initial parameters provided by strategy")
+            return parameters
+
+        # Get initial parameters from one of the clients
+        log(INFO, "Requesting initial parameters from one random client")
+        random_client = self._client_manager.sample(1)[0]
+        ins = GetParametersIns(config={})
+        get_parameters_res_tree = random_client.get_parameters(ins=ins, timeout=timeout)
+        parameters = [get_parameters_res_tree[0].parameters, get_parameters_res_tree[1]]
+        log(INFO, "Received initial parameters from one random client")
+
+        return parameters
+
+def tree_encoding_loader(
+    dataloader: DataLoader,
+    batch_size: int,
+    client_trees: Union[
+        Tuple[XGBClassifier, int],
+        Tuple[XGBRegressor, int],
+        List[Union[Tuple[XGBClassifier, int], Tuple[XGBRegressor, int]]],
+    ],
+    client_tree_num: int,
+    client_num: int,
+) -> DataLoader:
+    encoding = tree_encoding(dataloader, client_trees, client_tree_num, client_num)
+    if encoding is None:
+        return None
+    data, labels = encoding
+    tree_dataset = TreeDataset(data, labels)
+    return get_dataloader(tree_dataset, "tree", batch_size)
+
 
 def get_data(reg : bool = False): 
     # Select the downloaded training and test dataset
@@ -490,3 +946,157 @@ def simulate_client(trainset, testset, client_num, client_tree_num, task, X_test
                 result_test = mean_squared_error(y_test, preds_test)
                 print("Local Client %d XGBoost Training MSE: %f" % (i, result_train))
                 print("Local Client %d XGBoost Testing MSE: %f" % (i, result_test))
+
+def print_model_layers(model: nn.Module) -> None:
+    print(model)
+    for param_tensor in model.state_dict():
+        print(param_tensor, "\t", model.state_dict()[param_tensor].size())
+
+
+def serverside_eval(
+    server_round: int,
+    parameters: Tuple[
+        Parameters,
+        Union[
+            Tuple[XGBClassifier, int],
+            Tuple[XGBRegressor, int],
+            List[Union[Tuple[XGBClassifier, int], Tuple[XGBRegressor, int]]],
+        ],
+    ],
+    config: Dict[str, Scalar],
+    task_type: str,
+    testloader: DataLoader,
+    batch_size: int,
+    client_tree_num: int,
+    client_num: int,
+) -> Tuple[float, Dict[str, float]]:
+    """An evaluation function for centralized/serverside evaluation over the entire test set."""
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    #device = "cpu"
+    model = CNN()
+    # print_model_layers(model)
+
+    model.set_weights(parameters_to_ndarrays(parameters[0]))
+    model.to(device)
+
+    trees_aggregated = parameters[1]
+    testloader = tree_encoding_loader(
+        testloader, batch_size, trees_aggregated, client_tree_num, client_num
+    )
+    loss, result, _ = test(
+        task_type, model, testloader, device=device, log_progress=False
+    )
+
+    if task_type == "classification":
+        print(
+            f"Evaluation on the server: test_loss={loss:.4f}, test_accuracy={result:.4f}"
+        )
+        return loss, {"accuracy": result}
+    elif task_type == "regression":
+        print(f"Evaluation on the server: test_loss={loss:.4f}, test_mse={result:.4f}")
+        return loss, {"mse": result}
+
+
+def start_experiment(
+    task_type: str,
+    trainset: Dataset,
+    testset: Dataset,
+    num_rounds: int = 5,
+    client_tree_num: int = 50,
+    client_num: int = 5,
+    num_iterations: int = 100,
+    fraction_fit: float = 1.0,
+    min_fit_clients: int = 2,
+    batch_size: int = 32,
+    val_ratio: float = 0.1,
+) -> History:
+    client_resources = {"num_cpus": 0.5}  # 2 clients per CPU
+
+    # Partition the dataset into subsets reserved for each client.
+    # - 'val_ratio' controls the proportion of the (local) client reserved as a local test set
+    # (good for testing how the final model performs on the client's local unseen data)
+    trainloaders, valloaders, testloader = do_fl_partitioning(
+        trainset,
+        testset,
+        batch_size="whole",
+        pool_size=client_num,
+        val_ratio=val_ratio,
+    )
+    print(
+        f"Data partitioned across {client_num} clients"
+        f" and {val_ratio} of local dataset reserved for validation."
+    )
+
+    # Configure the strategy
+    def fit_config(server_round: int) -> Dict[str, Scalar]:
+        print(f"Configuring round {server_round}")
+        return {
+            "num_iterations": num_iterations,
+            "batch_size": batch_size,
+        }
+
+    # FedXgbNnAvg
+    strategy = FedXgbNnAvg(
+        fraction_fit=fraction_fit,
+        fraction_evaluate=fraction_fit if val_ratio > 0.0 else 0.0,
+        min_fit_clients=min_fit_clients,
+        min_evaluate_clients=min_fit_clients,
+        min_available_clients=client_num,  # all clients should be available
+        on_fit_config_fn=fit_config,
+        on_evaluate_config_fn=(lambda r: {"batch_size": batch_size}),
+        evaluate_fn=functools.partial(
+            serverside_eval,
+            task_type=task_type,
+            testloader=testloader,
+            batch_size=batch_size,
+            client_tree_num=client_tree_num,
+            client_num=client_num,
+        ),
+        accept_failures=False,
+    )
+
+    print(
+        f"FL experiment configured for {num_rounds} rounds with {client_num} client in the pool."
+    )
+    print(
+        f"FL round will proceed with {fraction_fit * 100}% of clients sampled, at least {min_fit_clients}."
+    )
+
+    def client_fn(cid: str) -> fl.client.Client:
+        """Creates a federated learning client"""
+        if val_ratio > 0.0 and val_ratio <= 1.0:
+            print("Task: ", task_type)
+            return FL_Client(
+                task_type,
+                trainloaders[int(cid)],
+                valloaders[int(cid)],
+                client_tree_num,
+                client_num,
+                cid,
+                log_progress=False,
+            )
+        else:
+            print("Task HERE: ", task_type)
+            return FL_Client(
+                task_type,
+                trainloaders[int(cid)],
+                None,
+                client_tree_num,
+                client_num,
+                cid,
+                log_progress=False,
+            )
+
+    # Start the simulation
+    history = fl.simulation.start_simulation(
+        client_fn=client_fn,
+        server=FL_Server(client_manager=SimpleClientManager(), strategy=strategy),
+        num_clients=client_num,
+        client_resources=client_resources,
+        config=ServerConfig(num_rounds=num_rounds),
+        strategy=strategy,
+    )
+
+    print(history)
+
+    return history
