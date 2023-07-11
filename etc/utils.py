@@ -108,10 +108,11 @@ class CNN(nn.Module):
             if v.ndim != 0:
                 layer_dict[k] = torch.Tensor(np.array(v, copy=True))
         print(layer_dict)
-        state_dict = OrderedDict(layer_dict)
+        # state_dict = OrderedDict(layer_dict)
+        state_dict = layer_dict
         print("WAIT HERE ", "\n")
         print(state_dict)
-        self.load_state_dict(state_dict, strict=True)
+        self.load_state_dict(state_dict, strict=False)
 
 
 def train(
@@ -1019,6 +1020,7 @@ def start_experiment(
         trainset,
         testset,
         batch_size="whole",
+        #batch_size = 64,
         pool_size=client_num,
         val_ratio=val_ratio,
     )
